@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""lab-ai — the course tutor protocol helper (model-agnostic).
+
+The pedagogy of the AI tutor does NOT live in any one model. It lives in a small set of
+context files and one fixed output contract (diagnosis -> hint -> minimal diff ->
+explanation -> measure -> check question). This script is the glue that lets that contract
+travel to *any* AI tool:
+
+  gen      render each lab's lab.yaml -> .continue/rules/lab.md (used by local Continue
+           AND embedded by `bundle`). lab.yaml is the single source of truth.
+  bundle   assemble one paste-ready request (contract + board context + this lab's rules +
+           your code + your current `git diff` + your question) for Codex/Claude/ChatGPT/…
+  apply    take the AI's reply, pull out the unified diff, `git apply --check` then apply —
+           so help arrives as a reviewable patch, never a mystery whole-file replacement.
+  log      append a lab-log-shaped "If I used AI tools" entry, for the oral sign-off.
+
+Everything is local and offline; nothing here calls a model itself.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+# The es201 root is where this script and the shared .ai/ context live.
+ROOT = Path(__file__).resolve().parent
+AI_DIR = ROOT / ".ai"
+# The course docs live in the superrepo (es201 is a submodule under src/). Used to ground
+# answers on the pages a lab.yaml lists in `references:`. Absent in a bare es201 checkout.
+DOCS_ROOT = ROOT.parent.parent / "docs"
+
+
+# ---------------------------------------------------------------- helpers ----
+def load_yaml(path):
+    try:
+        import yaml
+    except ImportError:
+        sys.exit("lab-ai: PyYAML is required (pip install pyyaml).")
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def find_lab(explicit):
+    """Resolve which lab we're working on: --lab, else the cwd (or its lab ancestor)."""
+    if explicit:
+        p = Path(explicit).resolve()
+        if (p / "lab.yaml").exists():
+            return p
+        sys.exit(f"lab-ai: no lab.yaml in {p}")
+    here = Path.cwd().resolve()
+    for cand in (here, *here.parents):
+        if (cand / "lab.yaml").exists():
+            return cand
+        if cand == ROOT:
+            break
+    sys.exit("lab-ai: run inside a lab folder (one with a lab.yaml), or pass --lab DIR.")
+
+
+def git(*args):
+    """Run git in the es201 repo, return stdout (empty on failure)."""
+    r = subprocess.run(["git", "-C", str(ROOT), *args],
+                       capture_output=True, text=True)
+    return r.stdout
+
+
+def lab_rel(lab):
+    """Path of the lab relative to the es201 repo root, for scoping git/diffs."""
+    try:
+        return str(lab.relative_to(ROOT))
+    except ValueError:
+        return "."
+
+
+# ---------------------------------------------------------- SDK grounding ----
+# The Pico SDK is the ground truth for "does this function exist / what's its
+# signature". We index it so the tutor can be fed real signatures (input) and its
+# proposed diff can be linted for invented APIs (output) — the #1 small-model bug.
+# Precise source would be Doxygen's tag file; when doxygen isn't installed we parse
+# the headers directly (heuristic, high-recall). Set PICO_SDK_PATH, or put the path
+# in .ai/sdk.path.
+SDK_INDEX = AI_DIR / "sdk-index.json"
+SDK_META = AI_DIR / "sdk-meta.json"   # {sdk, examples} — lets the MCP find pico-examples
+_KW = {"if", "for", "while", "switch", "return", "sizeof", "do", "else", "case"}
+# C keywords that must never be treated as a function name (e.g. `__asm volatile("nop")`
+# would otherwise index "volatile"). Used to reject the captured NAME, not the return type.
+_NAME_BAD = _KW | {"volatile", "const", "static", "inline", "struct", "enum", "union",
+                   "unsigned", "signed", "void", "char", "short", "int", "long", "float",
+                   "double", "register", "extern", "typedef", "goto", "break", "continue",
+                   "default", "asm", "auto", "restrict"}
+_BUILTINS = {"printf", "sprintf", "snprintf", "puts", "putchar", "getchar", "scanf",
+             "memcpy", "memset", "memmove", "strlen", "strcmp", "strncmp", "strcpy",
+             "malloc", "free", "abs", "main"}
+# A declaration = one-or-more "typeword " tokens, then a name, then (args) then ; or {
+_DECL = re.compile(r"[;{}\n][ \t]*((?:[A-Za-z_]\w*[ \t\*]+)+)([a-z_]\w*)[ \t]*"
+                   r"\(([^;{}()]*)\)[ \t]*[;{]")
+
+
+def sdk_root():
+    p = os.environ.get("PICO_SDK_PATH")
+    if not p and (AI_DIR / "sdk.path").exists():
+        p = (AI_DIR / "sdk.path").read_text().strip()
+    return Path(p) if p and Path(p).exists() else None
+
+
+def _strip_comments(s):
+    s = re.sub(r"/\*.*?\*/", " ", s, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", s)
+
+
+def _ws(s):
+    return " ".join(s.split())
+
+
+def build_sdk_index(sdk):
+    """Parse SDK public headers -> {name: {"sig":…, "hdr":…}}."""
+    idx = {}
+    for h in (sdk / "src").rglob("*.h"):
+        if "/include/" not in h.as_posix():
+            continue
+        try:
+            text = _strip_comments(h.read_text(errors="ignore"))
+        except OSError:
+            continue
+        for ret, name, args in _DECL.findall(text):
+            if name in _NAME_BAD or name in idx:
+                continue
+            ret = _ws(ret)
+            if not ret or ret.split()[-1] in _KW:
+                continue
+            rel = h.relative_to(sdk).as_posix()
+            idx[name] = {"sig": f"{ret} {name}({_ws(args) or 'void'})", "hdr": rel}
+    return idx
+
+
+def build_sdk_index_doxygen(sdk):
+    """Precise index via Doxygen XML: name -> {sig, hdr, brief}. Needs `doxygen`."""
+    tmp = Path(tempfile.mkdtemp(prefix="pico-dox-"))
+    (tmp / "Doxyfile").write_text(
+        f"INPUT = {sdk}/src\nRECURSIVE = YES\n"
+        "EXCLUDE_PATTERNS = */hardware_regs/* */lib/* */pico_cyw43_driver/* */host/*\n"
+        "GENERATE_HTML = NO\nGENERATE_LATEX = NO\nGENERATE_XML = YES\n"
+        f"XML_OUTPUT = {tmp}/xml\n"
+        "EXTRACT_ALL = YES\nEXTRACT_STATIC = YES\nMACRO_EXPANSION = YES\n"
+        "QUIET = YES\nWARNINGS = NO\nWARN_IF_UNDOCUMENTED = NO\n")
+    subprocess.run(["doxygen", str(tmp / "Doxyfile")], cwd=tmp,
+                   capture_output=True, text=True)
+    idx = {}
+    for f in (tmp / "xml").glob("*.xml"):
+        try:
+            root = ET.parse(f).getroot()
+        except ET.ParseError:
+            continue
+        for m in root.iter("memberdef"):
+            if m.get("kind") != "function":
+                continue
+            name = m.findtext("name") or ""
+            defn = (m.findtext("definition") or "").strip()
+            if not name or name.startswith("__") or name in idx or not defn:
+                continue
+            args = (m.findtext("argsstring") or "").strip()
+            bd = m.find("briefdescription")
+            brief = _ws("".join(bd.itertext())) if bd is not None else ""
+            loc, hdr = m.find("location"), ""
+            if loc is not None and loc.get("file"):
+                try:
+                    hdr = Path(loc.get("file")).resolve().relative_to(sdk.resolve()).as_posix()
+                except ValueError:
+                    hdr = Path(loc.get("file")).name
+            idx[name] = {"sig": _ws(defn + args), "hdr": hdr, "brief": brief}
+    shutil.rmtree(tmp, ignore_errors=True)
+    return idx
+
+
+def examples_root(sdk):
+    p = os.environ.get("PICO_EXAMPLES_PATH")
+    cands = ([Path(p)] if p else []) + [sdk.parent / "pico-examples"]
+    return next((c for c in cands if c.exists()), None)
+
+
+def load_sdk_index(build_if_missing=True):
+    if SDK_INDEX.exists():
+        return json.loads(SDK_INDEX.read_text())
+    if not build_if_missing:
+        return {}
+    sdk = sdk_root()
+    if not sdk:
+        return {}
+    idx = build_sdk_index(sdk)
+    SDK_INDEX.write_text(json.dumps(idx))
+    return idx
+
+
+def local_symbols(lab):
+    """Function names the student defines locally (so the lint doesn't flag them)."""
+    names = set()
+    for src in [*lab.glob("*.c"), *lab.glob("*.h")]:
+        for _ret, name, _args in _DECL.findall(_strip_comments(src.read_text(errors="ignore"))):
+            names.add(name)
+    return names
+
+
+def cmd_sdk(args):
+    sdk = sdk_root()
+    if not sdk:
+        sys.exit("lab-ai sdk: set PICO_SDK_PATH (or write the path to .ai/sdk.path).")
+    if shutil.which("doxygen") and not args.headers_only:
+        idx, how = build_sdk_index_doxygen(sdk), "doxygen (signatures + doc summaries)"
+    else:
+        idx, how = build_sdk_index(sdk), "header-parse (signatures only)"
+    SDK_INDEX.write_text(json.dumps(idx))
+    ex = examples_root(sdk)
+    SDK_META.write_text(json.dumps({"sdk": str(sdk), "examples": str(ex) if ex else ""}))
+    print(f"sdk: indexed {len(idx)} symbols via {how} -> {SDK_INDEX.relative_to(ROOT)}")
+    print(f"     examples: {ex if ex else '(pico-examples not found — set PICO_EXAMPLES_PATH)'}")
+    for probe in ("get_absolute_time", "add_repeating_timer_ms", "gpio_put"):
+        e = idx.get(probe, {})
+        print(f"  {probe}: {e.get('sig', 'MISSING')}"
+              + (f"  — {e['brief']}" if e.get("brief") else ""))
+
+
+# Doxygen tag `kind` -> Dash/Zeal entry type.
+_KIND2TYPE = {"function": "Function", "define": "Macro", "typedef": "Type",
+              "enumeration": "Enum", "enumvalue": "Value", "variable": "Variable",
+              "struct": "Struct", "union": "Union", "file": "File", "group": "Module"}
+
+_INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>picosdk</string>
+  <key>CFBundleName</key><string>Pico SDK</string>
+  <key>DocSetPlatformFamily</key><string>picosdk</string>
+  <key>DashDocSetFamily</key><string>doxy</string>
+  <key>isDashDocset</key><true/>
+  <key>dashIndexFilePath</key><string>index.html</string>
+  <key>isJavaScriptEnabled</key><false/>
+</dict></plist>
+"""
+
+
+def cmd_docset(args):
+    if not shutil.which("doxygen"):
+        sys.exit("lab-ai docset: doxygen is required.")
+    sdk = sdk_root()
+    if not sdk:
+        sys.exit("lab-ai docset: set PICO_SDK_PATH (or write it to .ai/sdk.path).")
+
+    zeal = Path.home() / ".local/share/Zeal/Zeal/docsets"
+    out = Path(args.out).expanduser() if args.out else \
+        (zeal / "PicoSDK.docset" if zeal.exists() else AI_DIR / "PicoSDK.docset")
+
+    tmp = Path(tempfile.mkdtemp(prefix="pico-docset-"))
+    (tmp / "Doxyfile").write_text(
+        f'PROJECT_NAME = "Pico SDK"\nINPUT = {sdk}/src\nRECURSIVE = YES\n'
+        "EXCLUDE_PATTERNS = */hardware_regs/* */lib/* */pico_cyw43_driver/* */host/*\n"
+        f"OUTPUT_DIRECTORY = {tmp}\nGENERATE_LATEX = NO\nGENERATE_HTML = YES\n"
+        "HTML_OUTPUT = html\nGENERATE_DOCSET = YES\nDISABLE_INDEX = YES\n"
+        "GENERATE_TREEVIEW = NO\nSEARCHENGINE = NO\n"
+        # Match the SDK's own Doxyfile so pages render like the official docs: C mode, keep
+        # documented static-inline functions, and STRIP the SDK's function attributes via
+        # PREDEFINED — otherwise doxygen mis-parses (`int value`) and drops the \brief/params.
+        "OPTIMIZE_OUTPUT_FOR_C = YES\nEXTRACT_ALL = NO\nEXTRACT_STATIC = YES\n"
+        "MACRO_EXPANSION = YES\n"
+        "PREDEFINED = __not_in_flash_func(x)= __time_critical_func(x)= __not_in_flash(x)= "
+        "__no_inline_not_in_flash(x)= __attribute__(x)= DOXYGEN_GENERATION=\n"
+        # Source browser + INLINE_SOURCES: show each function's actual body (the .h/.c
+        # implementation) right in its doc entry, so "how does it work" needs no click —
+        # and it sidesteps Zeal not honouring the "Definition at line" fragment jump.
+        "SOURCE_BROWSER = YES\nINLINE_SOURCES = YES\nSTRIP_CODE_COMMENTS = NO\n"
+        "REFERENCED_BY_RELATION = YES\nREFERENCES_RELATION = YES\n"
+        f"GENERATE_TAGFILE = {tmp}/pico.tag\nQUIET = YES\nWARNINGS = NO\n")
+    print("docset: running doxygen (this takes ~1 min)…")
+    subprocess.run(["doxygen", str(tmp / "Doxyfile")], cwd=tmp, capture_output=True, text=True)
+    html, tag = tmp / "html", tmp / "pico.tag"
+    if not (html / "index.html").exists() or not tag.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+        sys.exit("docset: doxygen did not produce html/ + tag — check the SDK path.")
+
+    # Assemble the .docset bundle.
+    docs = out / "Contents/Resources/Documents"
+    if out.exists():
+        shutil.rmtree(out)
+    docs.mkdir(parents=True)
+    for item in html.iterdir():
+        (shutil.copytree if item.is_dir() else shutil.copy2)(item, docs / item.name)
+    (out / "Contents/Info.plist").write_text(_INFO_PLIST)
+
+    # Build the search index (SQLite) from the tag file.
+    import sqlite3
+    rows, seen = [], set()
+    for comp in ET.parse(tag).getroot().findall("compound"):
+        ck, cn, cf = comp.get("kind"), comp.findtext("name"), comp.findtext("filename")
+        if ck in _KIND2TYPE and cn and cf and (cn, cf) not in seen:
+            seen.add((cn, cf)); rows.append((cn, _KIND2TYPE[ck], cf))
+        for mem in comp.findall("member"):
+            mk, mn = mem.get("kind"), mem.findtext("name")
+            af, an = mem.findtext("anchorfile"), mem.findtext("anchor")
+            if mk in _KIND2TYPE and mn and af:
+                path = af + ("#" + an if an else "")
+                if (mn, path) not in seen:
+                    seen.add((mn, path)); rows.append((mn, _KIND2TYPE[mk], path))
+    db = sqlite3.connect(out / "Contents/Resources/docSet.dsidx")
+    db.executescript("CREATE TABLE searchIndex(id INTEGER PRIMARY KEY, name TEXT, "
+                     "type TEXT, path TEXT); CREATE UNIQUE INDEX anchor ON "
+                     "searchIndex (name, type, path);")
+    db.executemany("INSERT OR IGNORE INTO searchIndex(name,type,path) VALUES (?,?,?)", rows)
+    db.commit(); db.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    print(f"docset: {len(rows)} entries -> {out}")
+    if zeal in out.parents:
+        print("  Zeal will show it on next launch (or Zeal → Docsets refresh).")
+    else:
+        print("  Zeal isn't set up yet. Install it (e.g. `sudo pacman -S zeal`), then:")
+        print(f"    mkdir -p {zeal} && mv {out} {zeal}/")
+        print(f"  Or just open the HTML: xdg-open {out}/Contents/Resources/Documents/index.html")
+    print("  VS Code: install the 'deerawan.vscode-dash' extension, then a key opens the "
+          "docset for the word under the cursor.")
+
+
+def cmd_check(args):
+    idx = load_sdk_index()
+    # A lab gives us the student's local function names; it's optional for `check`.
+    lab = None
+    for cand in ([Path(args.lab).resolve()] if args.lab else
+                 [Path.cwd().resolve(), *Path.cwd().resolve().parents]):
+        if (cand / "lab.yaml").exists():
+            lab = cand
+            break
+        if cand == ROOT:
+            break
+    text = sys.stdin.read() if args.reply == "-" else Path(args.reply).read_text()
+    patch = extract_diff(text) or text
+    added = "\n".join(l[1:] for l in patch.splitlines()
+                      if l.startswith("+") and not l.startswith("+++"))
+    calls = set(re.findall(r"\b([a-z_]\w{2,})\s*\(", added))
+    local = local_symbols(lab) if lab else set()
+    # names the diff itself defines are local too
+    local |= {n for _r, n, _a in _DECL.findall(_strip_comments("\n" + added))}
+    if not idx:
+        print("lab-ai check: no SDK index (set PICO_SDK_PATH, run `./lab-ai sdk`) — "
+              "skipping API validation.")
+    unknown = sorted(c for c in calls
+                     if c not in idx and c not in local and c not in _BUILTINS)
+    if idx and not unknown:
+        print("lab-ai check: every called function resolves to the SDK, a local, or a "
+              "builtin ✓")
+    for c in unknown:
+        print(f"  ⚠ {c}() — not in the Pico SDK index; verify it exists (small models "
+              f"invent plausible SDK calls).")
+
+
+# ------------------------------------------------------------------- gen ----
+def render_rule(meta):
+    """lab.yaml -> a Continue rule / bundle-embeddable Markdown block."""
+    def bullets(key):
+        return "\n".join(f"- {x}" for x in meta.get(key, [])) or "- (none listed)"
+
+    hp = meta.get("help_policy", {})
+    policy = ", ".join(f"{k}: {v}" for k, v in hp.items()) or "(defaults)"
+    tools = ", ".join(meta.get("measure_tools", [])) or "hob, serial, scope"
+    refs = meta.get("references", [])
+    read_first = ("\n## Read first (point the student here in the hint)\n"
+                  + "\n".join(f"- {Path(r).stem} (`{r}`)" for r in refs)) if refs else ""
+    return f"""# Tutor rules — {meta.get('title', meta.get('lab_id', 'this lab'))}
+
+*Generated from `lab.yaml` by `lab-ai gen` — do not edit by hand.*
+Follow the shared [contract](../../.ai/contract.md): diagnosis → hint → minimal diff →
+explanation → measure → one check question. This lab pins the tutor to the concepts below.
+
+## Learning goals (what "measure-next" should serve)
+{bullets('learning_goals')}
+
+## Allowed concepts — stay inside these
+{bullets('allowed_concepts')}
+
+## Forbidden concepts — if the fix needs one, say "that's a later lab" and stay in-scope
+{bullets('forbidden_concepts')}
+
+## Help policy
+{policy}
+
+## Measure with
+{tools}
+{read_first}
+"""
+
+
+def cmd_gen(args):
+    labs = ([find_lab(args.lab)] if not args.all
+            else sorted(p.parent for p in ROOT.glob("*/lab.yaml")))
+    if not labs:
+        sys.exit("lab-ai gen: no lab.yaml found.")
+    for lab in labs:
+        meta = load_yaml(lab / "lab.yaml")
+        out = lab / ".continue" / "rules" / "lab.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(render_rule(meta))
+        print(f"gen: {out.relative_to(ROOT)}")
+
+
+# ---------------------------------------------------------------- bundle ----
+def cmd_bundle(args):
+    lab = find_lab(args.lab)
+    meta = load_yaml(lab / "lab.yaml")
+    rel = lab_rel(lab)
+
+    # Make sure this lab's rule is current, then reuse it verbatim.
+    rule_file = lab / ".continue" / "rules" / "lab.md"
+    rule = rule_file.read_text() if rule_file.exists() else render_rule(meta)
+
+    # Source: explicit --files, else every .c/.h in the lab folder.
+    if args.files:
+        srcs = [Path(f).resolve() for f in args.files]
+    else:
+        srcs = sorted([*lab.glob("*.c"), *lab.glob("*.h")])
+
+    diff = git("diff", "--", rel).strip()
+
+    parts = [
+        (AI_DIR / "contract.md").read_text(),
+        (AI_DIR / "board-context.md").read_text(),
+        rule,
+        f"# My question\n\n{args.question}\n",
+    ]
+    code = "\n".join(
+        f"## `{s.relative_to(ROOT) if ROOT in s.parents else s.name}`\n\n"
+        f"```c\n{s.read_text()}\n```\n" for s in srcs if s.exists())
+    parts.append(f"# My current code\n\n{code or '(no source files found)'}")
+
+    # Ground the model on REAL SDK signatures for the functions actually in play —
+    # so it can't invent APIs. Only inject symbols that appear in the code/question.
+    idx = load_sdk_index()
+    if idx:
+        seen = set(re.findall(r"[a-z_][a-z0-9_]{2,}", code + " " + args.question))
+        used = sorted(s for s in seen if s in idx)[:50]
+        if used:
+            sigs = "\n".join(
+                f"- `{idx[s]['sig']};`" + (f" — {idx[s]['brief']}" if idx[s].get("brief") else "")
+                + f"   ({idx[s]['hdr']})" for s in used)
+            parts.append("# Relevant Pico SDK signatures (ground truth — use these EXACTLY, "
+                         "don't invent variants)\n\n" + sigs)
+
+    parts.append("# My current `git diff`\n\n"
+                 + (f"```diff\n{diff}\n```" if diff else "(no uncommitted changes)"))
+
+    # Ground the answer on the course pages this lab lists — if the docs tree is present.
+    refs = []
+    for r in meta.get("references", []):
+        p = DOCS_ROOT / r
+        if p.exists():
+            refs.append(f"## {p.stem}  (`{r}`)\n\n{p.read_text()}")
+    if refs:
+        parts.append("# Course references for this lab (the source of truth — prefer these)\n\n"
+                     + "\n\n".join(refs))
+
+    banner = ("<!-- Paste everything below into your AI tool. It is instructed to answer "
+              "as the course tutor: a minimal diff you can review, explained, with "
+              "something to measure. Then: ./lab-ai apply <its-reply>. -->\n\n")
+    out = AI_DIR / "request.md"
+    out.write_text(banner + "\n\n---\n\n".join(parts))
+    print(f"bundle: wrote {out.relative_to(ROOT)}  ({len(srcs)} source file(s), "
+          f"{'diff included' if diff else 'no diff'})")
+    print("Paste it into any AI tool, then: ./lab-ai apply <the-reply-file>")
+
+
+# ----------------------------------------------------------------- apply ----
+def extract_diff(text):
+    """Pull a unified diff out of an AI reply: prefer a ```diff fence, else scan."""
+    lines = text.splitlines()
+    # 1) fenced ```diff / ```patch block
+    for fence in ("```diff", "```patch"):
+        if fence in text:
+            start = next(i for i, l in enumerate(lines) if l.strip().startswith(fence))
+            body = []
+            for l in lines[start + 1:]:
+                if l.strip() == "```":
+                    break
+                body.append(l)
+            return "\n".join(body).strip() + "\n"
+    # 2) fallback: from the first diff marker to the end
+    for i, l in enumerate(lines):
+        if l.startswith("diff --git") or l.startswith("--- a/") or l.startswith("--- "):
+            return "\n".join(lines[i:]).strip() + "\n"
+    return None
+
+
+def cmd_apply(args):
+    text = sys.stdin.read() if args.reply == "-" else Path(args.reply).read_text()
+    patch = extract_diff(text)
+    if not patch:
+        sys.exit("lab-ai apply: no unified diff found in the reply "
+                 "(expected a ```diff block or `--- a/… / +++ b/…` lines).")
+    patch_file = AI_DIR / "last.patch"
+    patch_file.write_text(patch)
+
+    check = subprocess.run(["git", "-C", str(ROOT), "apply", "--check", str(patch_file)],
+                           capture_output=True, text=True)
+    if check.returncode != 0:
+        print(f"lab-ai apply: patch does NOT apply cleanly — saved to "
+              f"{patch_file.relative_to(ROOT)} for inspection.\n")
+        print(check.stderr.strip())
+        print("\nTip: the AI may have diffed against different line numbers. Re-run "
+              "`./lab-ai bundle` so it sees your current code, or fix the hunk by hand.")
+        sys.exit(1)
+    if args.check:
+        print("lab-ai apply: patch applies cleanly (checked, not applied). "
+              f"Review it: {patch_file.relative_to(ROOT)}")
+        return
+    subprocess.run(["git", "-C", str(ROOT), "apply", str(patch_file)], check=True)
+    # Show only the files THIS patch touched (the student's tree may already be dirty).
+    touched = sorted({l[6:].strip() for l in patch.splitlines()
+                      if l.startswith("+++ ") and not l.startswith("+++ /dev/null")})
+    touched = [t[2:] if t[1:2] == "/" else t for t in touched]   # strip a/ b/ i/ w/ prefix
+    print("lab-ai apply: applied. What this patch changed:\n")
+    print(git("diff", "--stat", "--", *touched) if touched else git("diff", "--stat"))
+    print("Now BUILD and MEASURE before you trust it — then `./lab-ai log`.")
+
+
+# ------------------------------------------------------------------- log ----
+LOG_HEADER = ("# AI assistance log\n\n"
+              "*Mirrors the lab log's \"If I used AI tools\" section. Honest entries carry "
+              "no penalty; they're how we confirm the tool taught you something.*\n")
+
+
+def cmd_log(args):
+    lab = find_lab(args.lab)
+    log = lab / "ai-log.md"
+    if not log.exists():
+        log.write_text(LOG_HEADER)
+    n = log.read_text().count("## Interaction")
+    entry = (f"\n## Interaction {n + 1}\n\n"
+             f"- **Tool used:** {args.tool or '________'}\n"
+             f"- **What I asked:** {args.asked or '________'}\n"
+             f"- **What I kept:** {args.kept or '________'}\n"
+             f"- **What I changed or rejected, and why:** {args.changed or '________'}\n"
+             f"- **One thing I verified myself by measuring:** {args.verified or '________'}\n")
+    with open(log, "a") as f:
+        f.write(entry)
+    print(f"log: appended Interaction {n + 1} to {log.relative_to(ROOT)}"
+          + ("" if args.asked else "  (fill in the blanks)"))
+
+
+# ------------------------------------------------------------------- main ----
+def main():
+    ap = argparse.ArgumentParser(prog="lab-ai", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    g = sub.add_parser("gen", help="render lab.yaml -> .continue/rules/lab.md")
+    g.add_argument("--lab"); g.add_argument("--all", action="store_true")
+    g.set_defaults(func=cmd_gen)
+
+    b = sub.add_parser("bundle", help="assemble a paste-ready request for any AI tool")
+    b.add_argument("--question", "-q", required=True)
+    b.add_argument("--lab"); b.add_argument("--files", nargs="*")
+    b.set_defaults(func=cmd_bundle)
+
+    a = sub.add_parser("apply", help="apply the unified diff from an AI reply")
+    a.add_argument("reply", help="file with the AI's reply, or - for stdin")
+    a.add_argument("--check", action="store_true", help="verify only, don't apply")
+    a.set_defaults(func=cmd_apply)
+
+    l = sub.add_parser("log", help="append an AI-usage entry for the sign-off")
+    l.add_argument("--lab")
+    for opt in ("tool", "asked", "kept", "changed", "verified"):
+        l.add_argument(f"--{opt}")
+    l.set_defaults(func=cmd_log)
+
+    s = sub.add_parser("sdk", help="(re)build the Pico SDK symbol index (needs PICO_SDK_PATH)")
+    s.add_argument("--headers-only", action="store_true",
+                   help="skip doxygen; parse headers (signatures only, no doc summaries)")
+    s.set_defaults(func=cmd_sdk)
+
+    c = sub.add_parser("check", help="lint an AI reply's diff for invented SDK calls")
+    c.add_argument("reply", help="file with the AI's reply, or - for stdin")
+    c.add_argument("--lab")
+    c.set_defaults(func=cmd_check)
+
+    d = sub.add_parser("docset", help="build a Zeal/Dash docset from the Pico SDK (needs doxygen)")
+    d.add_argument("--out", help="output .docset path (default: Zeal's dir, else .ai/)")
+    d.set_defaults(func=cmd_docset)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

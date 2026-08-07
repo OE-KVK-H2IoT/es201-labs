@@ -1,0 +1,19 @@
+# Point the clangd editor extension at the CMake compile database so it resolves
+# the Pico SDK includes and cross-compile flags. Generated in build/ by the
+# `set(CMAKE_EXPORT_COMPILE_COMMANDS ON)` in CMakeLists.txt — run `./run.sh build`
+# (or `cmake -B build`) once so build/compile_commands.json exists.
+CompileFlags:
+  CompilationDatabase: build
+  # arm-none-eabi flags clangd's own parser doesn't need; drop them to avoid noise.
+  Remove:
+    - -mcpu=*
+    - -mfpu=*
+    - -mfloat-abi=*
+    - -mthumb
+
+# Keep the editor QUIET for beginners: no inline type/parameter clutter. The useful
+# parts stay on-demand — hover a symbol for its doc summary, Ctrl/Cmd-click to jump to
+# the header. This is the "simple" behaviour: see one function's doc when you ask for it.
+InlayHints:
+  Enabled: No
+

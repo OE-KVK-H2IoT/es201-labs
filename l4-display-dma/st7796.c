@@ -62,6 +62,19 @@ static void push_pixels(uint16_t color, uint32_t count) {
     wait_spi();
 }
 
+// One pixel, the honest way: a 1x1 window, then two bytes of colour pushed by
+// blocking SPI. No DMA — a single pixel isn't worth a DMA setup, and the point
+// of this primitive is to expose the *per-pixel command overhead* (three commands
+// + eight address bytes for two bytes of pixel). Streaming fills below amortise
+// that one window-open over thousands of pixels; this pays it for every dot.
+void st7796_draw_pixel(uint16_t x, uint16_t y, uint16_t color) {
+    if (x >= ST7796_WIDTH || y >= ST7796_HEIGHT) return;
+    set_window(x, y, x, y);
+    uint8_t px[2] = { color >> 8, color & 0xFF };   // big-endian RGB565 on the wire
+    dat(px, 2);
+    wait_spi();
+}
+
 void st7796_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) {
     if (w == 0 || h == 0) return;
     set_window(x, y, x + w - 1, y + h - 1);

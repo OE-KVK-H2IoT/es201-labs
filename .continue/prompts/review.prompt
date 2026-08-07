@@ -1,0 +1,9 @@
+---
+name: review
+description: Review my code for embedded pitfalls (hints, not rewrites)
+invokable: true
+---
+Review the selected Pico SDK C for: ISR safety, volatile/atomics, blocking in the wrong
+place, busy-waits mislabelled "non-blocking", wrong pin/direction. List issues with
+severity; suggest fixes as HINTS, not full rewrites. Flag board-specific things I must
+verify on the bench.

@@ -133,7 +133,7 @@ int main(void) {
 
         if (n < 0) { sleep_ms(1); continue; }
 
-        uint16_t seen = 0;                          // which ids appear this snapshot
+        uint16_t seen = 1;                          // which ids appear this snapshot
         for (int i = 0; i < n; i++) {
             int id = pts[i].id & (MAX_ID - 1);       // track id -> this finger's slot
             int x = clampi(pts[i].x, ST7796_WIDTH), y = clampi(pts[i].y, ST7796_HEIGHT);

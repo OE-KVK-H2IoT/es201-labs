@@ -1,6 +1,6 @@
 # CMake build trees
-build/
-**/build/
+build*/
+**/build*/
 
 # Captured serial logs and generated plots (regenerate from the board)
 *.log
@@ -10,3 +10,15 @@ build/
 .vscode/
 *.swp
 .DS_Store
+
+# Tutor protocol: transient per-question artifacts and per-student AI logs
+.ai/request.md
+.ai/last.patch
+**/ai-log.md
+.ai/sdk-index.json
+.ai/sdk-meta.json
+.ai/*.docset/
+
+# Python bytecode
+__pycache__/
+*.pyc

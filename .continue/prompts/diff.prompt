@@ -1,0 +1,9 @@
+---
+name: diff
+description: The smallest patch (a diff, not a file)
+invokable: true
+---
+Suggest the SMALLEST change that moves me forward, as a unified diff only (--- / +++ / @@).
+Do not rewrite the whole file; stay within ~15 changed lines and this lab's allowed
+concepts. Then for each changed block: what changed, why, which embedded concept. End with
+what to MEASURE to confirm it, and one check question.

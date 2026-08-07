@@ -1,0 +1,8 @@
+---
+name: whybroke
+description: Diagnose a regression after a change
+invokable: true
+---
+I changed one thing and it broke. Ask me what I changed if I haven't said. Give a
+hypothesis and what to MEASURE (hob / print / scope) to confirm or falsify it, BEFORE any
+code. Paste the first build error, not the last.

@@ -1,0 +1,9 @@
+---
+name: hobnext
+description: What to check next with the hob debugger (no code)
+invokable: true
+---
+Don't give code. Given my open file and this symptom (I'll describe it): tell me where to
+set a breakpoint (function or file:line), what register / variable / peripheral to inspect
+in hob, what result would CONFIRM my hypothesis, and what would FALSIFY it. I'll run hob,
+do it, and report back what I saw.

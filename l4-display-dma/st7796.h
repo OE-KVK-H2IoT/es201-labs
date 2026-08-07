@@ -21,6 +21,11 @@
 #define ST_MAGENTA 0xF81F
 
 void st7796_init(void);
+// The smallest real panel operation: open a 1x1 window (CASET/RASET/RAMWR) and
+// push one 16-bit pixel over blocking SPI — no DMA, no rectangle. This is the
+// honest "cost of a pixel" through the command interface; build line/rect/etc.
+// on top of it (see gfx_primitives.c) and compare against the windowed fills below.
+void st7796_draw_pixel(uint16_t x, uint16_t y, uint16_t color);
 void st7796_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
 void st7796_fill_screen(uint16_t color);
 // Push an arbitrary w*h RGB565 buffer into a window (a "blit") — used to send a

@@ -1,0 +1,9 @@
+---
+name: hint
+description: A hint and what to measure — no code yet
+invokable: true
+---
+Do NOT give code. Using my open file and the active lab's rules, tell me: (1) the concept
+I'm likely missing, (2) which course section or measurement to look at FIRST, (3) one thing
+to measure on the board, (4) one question I should be able to answer. Stay inside this
+lab's allowed concepts.

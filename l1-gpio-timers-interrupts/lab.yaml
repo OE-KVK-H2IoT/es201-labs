@@ -1,0 +1,64 @@
+# Per-lab tutor context. Single source of truth: `./lab-ai gen` renders this into
+# .continue/rules/lab.md (for the local Continue assistant) and it is embedded by
+# `lab-ai bundle` (for any external AI tool). Keep it short and honest.
+lab_id: l1-gpio-timers-interrupts
+title: GPIO, Timers, and Interrupts
+
+# What the student should walk away understanding. The tutor points at these,
+# and "measure-next" steps should serve them.
+learning_goals:
+  - why sleep_ms() blocks the main loop (and what that costs)
+  - non-blocking periodic behaviour with a repeating timer / absolute_time deadlines
+  - sharing a flag between an ISR and main() safely with volatile
+  - measuring the delivered period vs the requested one, and input latency, on the bench
+
+# The tutor must stay inside these. This is the lab's whole point: the constraint
+# forces the intended solution instead of a more advanced shortcut.
+allowed_concepts:
+  - gpio_init / gpio_set_dir / gpio_put / gpio_get / gpio_xor_mask
+  - add_repeating_timer_ms and its callback
+  - a timer/IRQ callback that touches only volatiles
+  - volatile shared flag between ISR and main
+  - absolute_time_t / get_absolute_time / time_us_64 deadlines
+  - a small state variable (LED on/off, button edge)
+
+# If the natural fix needs one of these, the tutor says "that's a later lab" and
+# solves it within the allowed set.
+forbidden_concepts:
+  - FreeRTOS or any RTOS
+  - threads / multicore
+  - DMA
+  - full-file rewrite
+  - Arduino / PIC / STM32 HAL APIs
+
+help_policy:
+  first_response: hint        # hint | locate | diff — where the ladder starts
+  prefer_diff: true           # patches, not whole files
+  max_changed_lines: 15       # keep changes small enough to see
+  require_measure_step: true  # every answer ends with something to measure
+  require_check_question: true
+
+# What "measure-next" may reference for this lab.
+measure_tools:
+  - hob            # breakpoint the ISR, watch the volatile flag, "where am I?"
+  - serial         # printf the measured dt vs requested period
+  - gpio-scope     # scope/logic-analyzer on GP16 to see the real toggle timing
+
+# Course pages that ground this lab. The tutor names these in its "read first" hint;
+# `lab-ai bundle` embeds them (if the docs tree is present) so an external model is grounded
+# too. Paths are relative to the repo's docs/ root. Students can @-attach the same files in
+# Continue (e.g. @Reference/gpio-and-timers.md).
+references:
+  - Architecture Of Embedded Systems/Reference/gpio-and-timers.md
+  - Architecture Of Embedded Systems/Reference/interrupts-and-timing.md
+  - Architecture Of Embedded Systems/Tutorials/02-gpio-timers-interrupts.md
+
+# The canonical worked example the tutor can walk a student through: a naive
+# blocking blink that can't read a button, evolving into the timer-IRQ version.
+worked_example: >
+  Student starts with a sleep_ms()-based blink and finds the button is ignored while
+  the LED is mid-delay. The ladder: (hint) the loop is stopped inside sleep_ms so
+  nothing else runs; (measure) time the button reaction; (diff) replace the blocking
+  delay with a repeating timer whose callback toggles the LED via a volatile state,
+  freeing the loop to read the button; (measure) confirm the button now reacts and the
+  delivered period matches the request; (check) why must the shared flag be volatile?

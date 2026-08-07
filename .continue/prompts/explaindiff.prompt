@@ -1,0 +1,8 @@
+---
+name: explaindiff
+description: Explain the change I already made
+invokable: true
+---
+Here is my current change (git diff / selection). Explain each changed block: (1) what
+changed, (2) why, (3) which embedded concept it uses, (4) any bug it might introduce,
+(5) what to MEASURE now to confirm it. Don't add new code — just explain mine.
