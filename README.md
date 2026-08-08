@@ -73,3 +73,7 @@ The 🚧 labs have folder READMEs noting what they need; they're commented out i
 | RGB LED (WS2812) | GP12 |
 | Buzzer (passive) | GP13 |
 | Joystick X/Y | GP26/ADC0, GP27/ADC1 |
+
+## License
+
+MIT — see [LICENSE](LICENSE). The course documentation this code accompanies is CC BY 4.0 (see the courses repo).
