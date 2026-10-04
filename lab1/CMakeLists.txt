@@ -16,8 +16,7 @@ pico_sdk_init()
 
 add_executable(lab1 main.c picobot.c)
 target_include_directories(lab1 PRIVATE .)
-target_link_libraries(lab1
-    pico_stdlib pico_cyw43_arch_none hardware_pwm hardware_clocks)
+target_link_libraries(lab1 pico_stdlib hardware_clocks)
 pico_enable_stdio_usb(lab1 1)
 pico_enable_stdio_uart(lab1 1)
 pico_add_extra_outputs(lab1)
