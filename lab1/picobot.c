@@ -1,37 +1,26 @@
 /*
- * a0_first_contact.c — A0: first PicoBot program, Pico SDK only (reference implementation).
+ * picobot.c — the PicoBot driver implementation (our own, SDK only).
  *
- *   1. blinks the onboard LED (which lives on the CYW43 wireless chip)
- *   2. plays a short tone on the buzzer (PWM we configure ourselves)
- *   3. ramps the motors on the wheels-up stand, under our own failsafe
- *   4. stops feeding and lets the failsafe prove itself
- *
- * Board: PicoBot (RP2350 / Pico 2 W). SAFETY: run with the wheels clear of the
- * desk, on the robot's own supply, and keep the failsafe armed.
+ * Buzzer: a PWM square wave at the requested frequency, 50% duty.
+ * Motors: one H-bridge per side, two control pins each — drive one with PWM,
+ * hold the other low; swap them to reverse.
+ * Failsafe: a timestamp the application must "feed"; if it goes stale, stop.
  */
-#include <stdio.h>
+#include "picobot.h"
+
 #include "pico/stdlib.h"
-#include "pico/cyw43_arch.h"
 #include "hardware/clocks.h"
 #include "hardware/pwm.h"
 
-/* ---- PicoBot pin map (verify against your unit) ------------------------ */
-#define BUZZER_PIN   22u
-#define MOTOR_L_FWD  13u
-#define MOTOR_L_REV  12u
-#define MOTOR_R_FWD  10u
-#define MOTOR_R_REV  11u
-#define MOTOR_PWM_HZ 1000u
-
 /* ---- buzzer: a PWM square wave ----------------------------------------- */
-static void buzzer_init(void) {
+void buzzer_init(void) {
     gpio_set_function(BUZZER_PIN, GPIO_FUNC_PWM);
     uint slice = pwm_gpio_to_slice_num(BUZZER_PIN);
     pwm_set_clkdiv(slice, 64.0f);              /* 150 MHz / 64 = 2.34375 MHz */
     pwm_set_enabled(slice, false);
 }
 
-static void buzzer_tone(uint32_t freq_hz) {
+void buzzer_tone(uint32_t freq_hz) {
     uint slice = pwm_gpio_to_slice_num(BUZZER_PIN);
     uint32_t wrap = 2343750u / freq_hz - 1u;   /* period in counter ticks */
     pwm_set_wrap(slice, wrap);
@@ -39,7 +28,7 @@ static void buzzer_tone(uint32_t freq_hz) {
     pwm_set_enabled(slice, true);
 }
 
-static void buzzer_off(void) {
+void buzzer_off(void) {
     pwm_set_enabled(pwm_gpio_to_slice_num(BUZZER_PIN), false);
 }
 
@@ -79,7 +68,7 @@ static void motor_drive(uint pin_fwd, uint pin_rev, int16_t speed) {
     pwm_set_enabled(slice, true);
 }
 
-static void motors_init(void) {
+void motors_init(void) {
     uint slices[2] = {
         pwm_gpio_to_slice_num(MOTOR_L_FWD),
         pwm_gpio_to_slice_num(MOTOR_R_FWD),
@@ -95,7 +84,7 @@ static void motors_init(void) {
     motor_drive(MOTOR_R_FWD, MOTOR_R_REV, 0);
 }
 
-static void motors_set(int16_t left, int16_t right) {
+void motors_set(int16_t left, int16_t right) {
     if (left > 255) left = 255;
     if (left < -255) left = -255;
     if (right > 255) right = 255;
@@ -107,69 +96,14 @@ static void motors_set(int16_t left, int16_t right) {
 /* ---- failsafe: no feed for 500 ms -> motors stop ----------------------- */
 static uint32_t fs_last_ms;
 
-static void failsafe_arm(void) {
+void failsafe_arm(void) {
     fs_last_ms = to_ms_since_boot(get_absolute_time());
 }
 
-static void failsafe_feed(void) {
+void failsafe_feed(void) {
     fs_last_ms = to_ms_since_boot(get_absolute_time());
 }
 
-static uint32_t failsafe_age_ms(void) {
+uint32_t failsafe_age_ms(void) {
     return to_ms_since_boot(get_absolute_time()) - fs_last_ms;
-}
-
-int main(void) {
-    stdio_init_all();
-    sleep_ms(1500);                 /* let USB-CDC attach before the first print */
-
-    if (cyw43_arch_init()) {        /* the LED lives on the wireless chip */
-        printf("cyw43 init failed\n");
-        return 1;
-    }
-
-    printf("\n=== PicoBot A0 first contact ===\n");
-    printf("clock: %u Hz\n", (unsigned)clock_get_hz(clk_sys));
-
-    /* 1. blink the onboard LED (twice, as a hello) */
-    for (int i = 0; i < 2; i++) {
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-        sleep_ms(250);
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-        sleep_ms(250);
-    }
-    printf("blink: done\n");
-
-    /* 2. buzzer */
-    buzzer_init();
-    buzzer_tone(440);               /* A4 */
-    sleep_ms(300);
-    buzzer_tone(523);               /* C5 */
-    sleep_ms(300);
-    buzzer_off();
-    printf("buzzer: done\n");
-
-    /* 3. motors, under our failsafe */
-    motors_init();
-    failsafe_arm();
-
-    for (int i = 0; i < 5; i++) {
-        int16_t speed = (int16_t)(60 + i * 30);
-        motors_set(speed, speed);
-        failsafe_feed();
-        printf("motors: %d (age %u ms)\n", speed, (unsigned)failsafe_age_ms());
-        sleep_ms(400);
-    }
-
-    /* 4. stop feeding: the failsafe must trip by itself */
-    while (failsafe_age_ms() <= 500u) {
-        printf("waiting for failsafe... age %u ms\n", (unsigned)failsafe_age_ms());
-        sleep_ms(200);
-    }
-    motors_set(0, 0);
-    printf("failsafe tripped: motors stopped\n");
-
-    for (;;) {
-        tight_loop_contents();
-    }
 }
